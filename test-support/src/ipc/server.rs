@@ -124,6 +124,9 @@ pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
                 // Update last activity
                 *last_activity.lock().unwrap() = Instant::now();
 
+                // Set stream to blocking mode (listener is non-blocking for shutdown checks)
+                stream.set_nonblocking(false)?;
+
                 // Handle client connection
                 let mut stream_reader = BufReader::new(stream.try_clone()?);
 
