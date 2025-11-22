@@ -271,7 +271,14 @@ fn wait_for_ready(
 }
 
 pub fn socket_path(project_type: &str) -> PathBuf {
-    let socket_dir = std::env::temp_dir().join("rust-analyzer-mcp-sockets");
+    let socket_dir = std::env::temp_dir().join("ra-mcp");
     let _ = fs::create_dir_all(&socket_dir);
-    socket_dir.join(format!("{}.sock", project_type))
+    // Use shorter names to avoid SUN_LEN limit (104 bytes on macOS)
+    let socket_name = match project_type {
+        "test-project-diagnostics" => "diag.sock",
+        "test-project-concurrent" => "conc.sock",
+        "test-project-singleton" => "sing.sock",
+        _ => "main.sock",
+    };
+    socket_dir.join(socket_name)
 }
