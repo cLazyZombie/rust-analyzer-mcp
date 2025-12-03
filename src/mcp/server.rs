@@ -156,6 +156,7 @@ impl RustAnalyzerMCPServer {
     }
 
     async fn handle_request(&mut self, request: MCPRequest) -> MCPResponse {
+        log::debug!("{request:#?}");
         match request.method.as_str() {
             "initialize" => MCPResponse::Success {
                 jsonrpc: "2.0".to_string(),
