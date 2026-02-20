@@ -1,8 +1,12 @@
 use anyhow::Result;
 use log::info;
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 
 use super::client::RustAnalyzerClient;
+
+const MAX_WORKSPACE_DIAGNOSTIC_FILES: usize = 128;
+const SKIPPED_WORKSPACE_DIRS: [&str; 5] = [".git", "target", "node_modules", ".idea", ".vscode"];
 
 impl RustAnalyzerClient {
     pub async fn hover(&mut self, uri: &str, line: u32, character: u32) -> Result<Value> {
@@ -100,31 +104,52 @@ impl RustAnalyzerClient {
     }
 
     pub async fn workspace_diagnostics(&mut self) -> Result<Value> {
-        // Try workspace/diagnostic if available, otherwise collect from all open documents.
-        let params = json!({
-            "identifier": "rust-analyzer",
-            "previousResultId": null
-        });
+        if self.workspace_diagnostics_supported {
+            let params = json!({
+                "identifier": "rust-analyzer",
+                "previousResultId": null
+            });
 
-        match self
-            .send_request("workspace/diagnostic", Some(params))
-            .await
-        {
-            Ok(response) => Ok(response),
-            Err(_) => {
-                // Fallback: return diagnostics for all open documents.
-                let mut all_diagnostics = json!({});
-                let open_docs = self.open_documents.lock().await.clone();
-
-                for doc_uri in open_docs.iter() {
-                    if let Ok(diag) = self.diagnostics(doc_uri).await {
-                        all_diagnostics[doc_uri] = diag;
+            match self.send_request("workspace/diagnostic", Some(params)).await {
+                Ok(response) => {
+                    if let Some(normalized) = normalize_workspace_diagnostic_report(&response) {
+                        return Ok(normalized);
                     }
-                }
 
-                Ok(all_diagnostics)
+                    info!(
+                        "workspace/diagnostic returned unsupported response; falling back. Response: {:?}",
+                        response
+                    );
+                }
+                Err(err) => {
+                    info!("workspace/diagnostic request failed; falling back: {}", err);
+                }
             }
+        } else {
+            info!("workspace/diagnostic not supported by server; using fallback");
         }
+
+        self.workspace_diagnostics_fallback().await
+    }
+
+    async fn workspace_diagnostics_fallback(&mut self) -> Result<Value> {
+        let stored = self.diagnostics.lock().await.clone();
+        let mut all_diagnostics = diagnostics_map_to_value(&stored);
+
+        // If nothing is known yet, open workspace files to trigger publishDiagnostics.
+        if all_diagnostics.is_empty() {
+            for file_path in collect_workspace_rust_files(&self.workspace_root) {
+                let uri = uri_from_path(&file_path);
+                if let Ok(content) = tokio::fs::read_to_string(&file_path).await {
+                    let _ = self.open_document(&uri, &content).await;
+                }
+            }
+
+            let stored = self.diagnostics.lock().await.clone();
+            all_diagnostics = diagnostics_map_to_value(&stored);
+        }
+
+        Ok(Value::Object(all_diagnostics))
     }
 
     pub async fn code_actions(
@@ -186,4 +211,102 @@ fn filter_diagnostics_in_range(diagnostics: &Value, start_line: u32, end_line: u
         .collect();
 
     json!(filtered)
+}
+
+fn normalize_workspace_diagnostic_report(response: &Value) -> Option<Value> {
+    if response.is_null() {
+        return None;
+    }
+
+    if let Some(obj) = response.as_object() {
+        // LSP pull-diagnostics shape: { "items": [ { "uri": "...", "items": [...] }, ... ] }
+        if let Some(items) = obj.get("items").and_then(|value| value.as_array()) {
+            let mut normalized = serde_json::Map::new();
+            for item in items {
+                let Some(uri) = item.get("uri").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+
+                let diagnostics = item
+                    .get("items")
+                    .or_else(|| item.get("diagnostics"))
+                    .cloned()
+                    .unwrap_or_else(|| json!([]));
+
+                if diagnostics.is_array() {
+                    normalized.insert(uri.to_string(), diagnostics);
+                }
+            }
+            return Some(Value::Object(normalized));
+        }
+
+        // Already normalized map: { "file://...": [ ... ] }
+        if obj.is_empty() || obj.values().all(Value::is_array) {
+            return Some(response.clone());
+        }
+    }
+
+    None
+}
+
+fn collect_workspace_rust_files(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_workspace_rust_files_recursive(workspace_root, &mut files);
+    files.sort();
+    files
+}
+
+fn collect_workspace_rust_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
+    if files.len() >= MAX_WORKSPACE_DIAGNOSTIC_FILES {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            if should_skip_workspace_dir(&path) {
+                continue;
+            }
+            collect_workspace_rust_files_recursive(&path, files);
+            if files.len() >= MAX_WORKSPACE_DIAGNOSTIC_FILES {
+                return;
+            }
+            continue;
+        }
+
+        let is_rust_file = path.extension().and_then(|ext| ext.to_str()) == Some("rs");
+        if is_rust_file {
+            files.push(path);
+            if files.len() >= MAX_WORKSPACE_DIAGNOSTIC_FILES {
+                return;
+            }
+        }
+    }
+}
+
+fn should_skip_workspace_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    SKIPPED_WORKSPACE_DIRS.contains(&name)
+}
+
+fn uri_from_path(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    format!("file://{}", canonical.display())
+}
+
+fn diagnostics_map_to_value(
+    diagnostics: &std::collections::HashMap<String, Vec<Value>>,
+) -> serde_json::Map<String, Value> {
+    diagnostics
+        .iter()
+        .map(|(uri, items)| (uri.clone(), json!(items)))
+        .collect()
 }

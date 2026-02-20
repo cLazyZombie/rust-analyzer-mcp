@@ -213,26 +213,57 @@ async fn test_workspace_diagnostics() -> Result<()> {
         }
     }
 
-    // Now get workspace diagnostics
-    let response = client
-        .call_tool("rust_analyzer_workspace_diagnostics", json!({}))
-        .await?;
+    // Now get workspace diagnostics and wait until aggregated counts become visible.
+    let mut parsed = serde_json::Value::Null;
+    for attempt in 0..max_attempts {
+        let response = client
+            .call_tool("rust_analyzer_workspace_diagnostics", json!({}))
+            .await?;
+        assert_tool_response(&response);
 
-    assert_tool_response(&response);
-    let content = response["content"][0]["text"].as_str().unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
+        let content = response["content"][0]["text"].as_str().unwrap();
+        parsed = serde_json::from_str(content).unwrap();
+
+        let total_errors = parsed["summary"]["total_errors"].as_u64().unwrap_or(0);
+        let total_warnings = parsed["summary"]["total_warnings"].as_u64().unwrap_or(0);
+        let total_information = parsed["summary"]["total_information"].as_u64().unwrap_or(0);
+        let total_hints = parsed["summary"]["total_hints"].as_u64().unwrap_or(0);
+        let total = total_errors + total_warnings + total_information + total_hints;
+
+        if total > 0 {
+            break;
+        }
+
+        if attempt < max_attempts - 1 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms)).await;
+        }
+    }
 
     // Check that we have workspace info
     assert!(parsed["workspace"].is_string());
+    assert!(parsed["files"].is_object(), "Expected files map in response");
+    assert!(parsed["summary"]["total_files"].is_number());
+    assert!(parsed["summary"]["total_errors"].is_number());
+    assert!(parsed["summary"]["total_warnings"].is_number());
+    assert!(parsed["summary"]["total_information"].is_number());
+    assert!(parsed["summary"]["total_hints"].is_number());
 
-    // Check structure based on response format
-    if parsed["files"].is_object() {
-        // Fallback format
-        assert!(parsed["summary"]["total_files"].is_number());
-    } else if parsed["diagnostics"].is_array() {
-        // Proper workspace diagnostic format
-        assert!(parsed["summary"]["total_diagnostics"].is_number());
-    }
+    let total_files = parsed["summary"]["total_files"].as_u64().unwrap_or(0);
+    let total_errors = parsed["summary"]["total_errors"].as_u64().unwrap_or(0);
+    let total_warnings = parsed["summary"]["total_warnings"].as_u64().unwrap_or(0);
+    let total_information = parsed["summary"]["total_information"].as_u64().unwrap_or(0);
+    let total_hints = parsed["summary"]["total_hints"].as_u64().unwrap_or(0);
+    let total_diagnostics = total_errors + total_warnings + total_information + total_hints;
+
+    assert!(total_files > 0, "Expected at least one file with diagnostics");
+    assert!(
+        total_diagnostics > 0,
+        "Expected non-zero workspace diagnostics summary"
+    );
+    assert!(
+        parsed["summary"]["note"].is_null(),
+        "Workspace diagnostics should not fall back to unexpected format note"
+    );
 
     // No need to shutdown with shared client
     Ok(())

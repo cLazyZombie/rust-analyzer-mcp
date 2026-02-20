@@ -318,29 +318,6 @@ async fn handle_workspace_diagnostics(
 }
 
 fn format_workspace_diagnostics(workspace_root: &Path, result: &Value) -> Value {
-    if !result.is_object() {
-        // Handle unexpected format.
-        if let Some(items) = result.get("items") {
-            return json!({
-                "workspace": workspace_root.display().to_string(),
-                "diagnostics": items,
-                "summary": {
-                    "total_diagnostics": items.as_array().map(|a| a.len()).unwrap_or(0),
-                    "by_severity": {}
-                }
-            });
-        }
-
-        return json!({
-            "workspace": workspace_root.display().to_string(),
-            "diagnostics": result,
-            "summary": {
-                "note": "Unexpected response format from rust-analyzer"
-            }
-        });
-    }
-
-    // Fallback format (diagnostics per URI).
     let mut output = json!({
         "workspace": workspace_root.display().to_string(),
         "files": {},
@@ -353,73 +330,124 @@ fn format_workspace_diagnostics(workspace_root: &Path, result: &Value) -> Value 
         }
     });
 
-    let mut total_errors = 0;
-    let mut total_warnings = 0;
-    let mut total_information = 0;
-    let mut total_hints = 0;
+    let mut totals = WorkspaceDiagnosticTotals::default();
     let mut file_count = 0;
 
     let Some(obj) = result.as_object() else {
         return output;
     };
 
-    for (uri, diagnostics) in obj {
-        let Some(diag_array) = diagnostics.as_array() else {
-            continue;
-        };
-
-        if diag_array.is_empty() {
-            continue;
-        }
-
-        file_count += 1;
-        let mut file_errors = 0;
-        let mut file_warnings = 0;
-        let mut file_information = 0;
-        let mut file_hints = 0;
-
-        for diag in diag_array {
-            let Some(severity) = diag.get("severity").and_then(|s| s.as_u64()) else {
+    if let Some(items) = obj.get("items").and_then(|value| value.as_array()) {
+        for item in items {
+            let Some(uri) = item.get("uri").and_then(|value| value.as_str()) else {
                 continue;
             };
-
-            match severity {
-                1 => {
-                    file_errors += 1;
-                    total_errors += 1;
-                }
-                2 => {
-                    file_warnings += 1;
-                    total_warnings += 1;
-                }
-                3 => {
-                    file_information += 1;
-                    total_information += 1;
-                }
-                4 => {
-                    file_hints += 1;
-                    total_hints += 1;
-                }
-                _ => {}
-            }
+            let empty_diagnostics = Value::Array(Vec::new());
+            let diagnostics = item
+                .get("items")
+                .or_else(|| item.get("diagnostics"))
+                .unwrap_or(&empty_diagnostics);
+            add_workspace_file_diagnostics(
+                &mut output,
+                uri,
+                diagnostics,
+                &mut file_count,
+                &mut totals,
+            );
         }
-
-        output["files"][uri] = json!({
-            "diagnostics": diagnostics,
-            "summary": {
-                "errors": file_errors,
-                "warnings": file_warnings,
-                "information": file_information,
-                "hints": file_hints
-            }
-        });
+    } else {
+        for (uri, diagnostics) in obj {
+            add_workspace_file_diagnostics(
+                &mut output,
+                uri,
+                diagnostics,
+                &mut file_count,
+                &mut totals,
+            );
+        }
     }
 
     output["summary"]["total_files"] = json!(file_count);
-    output["summary"]["total_errors"] = json!(total_errors);
-    output["summary"]["total_warnings"] = json!(total_warnings);
-    output["summary"]["total_information"] = json!(total_information);
-    output["summary"]["total_hints"] = json!(total_hints);
+    output["summary"]["total_errors"] = json!(totals.errors);
+    output["summary"]["total_warnings"] = json!(totals.warnings);
+    output["summary"]["total_information"] = json!(totals.information);
+    output["summary"]["total_hints"] = json!(totals.hints);
 
     output
+}
+
+#[derive(Default)]
+struct WorkspaceDiagnosticTotals {
+    errors: u64,
+    warnings: u64,
+    information: u64,
+    hints: u64,
+}
+
+fn add_workspace_file_diagnostics(
+    output: &mut Value,
+    uri: &str,
+    diagnostics: &Value,
+    file_count: &mut u64,
+    totals: &mut WorkspaceDiagnosticTotals,
+) {
+    let Some(diag_array) = diagnostics.as_array() else {
+        return;
+    };
+
+    if diag_array.is_empty() {
+        return;
+    }
+
+    *file_count += 1;
+    let mut file_errors = 0;
+    let mut file_warnings = 0;
+    let mut file_information = 0;
+    let mut file_hints = 0;
+
+    for diag in diag_array {
+        match workspace_diagnostic_severity(diag) {
+            Some(1) => {
+                file_errors += 1;
+                totals.errors += 1;
+            }
+            Some(2) => {
+                file_warnings += 1;
+                totals.warnings += 1;
+            }
+            Some(3) => {
+                file_information += 1;
+                totals.information += 1;
+            }
+            Some(4) => {
+                file_hints += 1;
+                totals.hints += 1;
+            }
+            _ => {}
+        }
+    }
+
+    output["files"][uri] = json!({
+        "diagnostics": diagnostics,
+        "summary": {
+            "errors": file_errors,
+            "warnings": file_warnings,
+            "information": file_information,
+            "hints": file_hints
+        }
+    });
+}
+
+fn workspace_diagnostic_severity(diagnostic: &Value) -> Option<u64> {
+    if let Some(severity) = diagnostic.get("severity").and_then(|value| value.as_u64()) {
+        return Some(severity);
+    }
+
+    match diagnostic.get("severity").and_then(|value| value.as_str()) {
+        Some("error") => Some(1),
+        Some("warning") => Some(2),
+        Some("information") => Some(3),
+        Some("hint") => Some(4),
+        _ => None,
+    }
 }

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use log::info;
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::PathBuf,
     process::Stdio,
     sync::Arc,
@@ -19,6 +19,12 @@ use crate::{
     protocol::lsp::LSPRequest,
 };
 
+#[derive(Debug, Clone)]
+pub(super) struct OpenDocumentState {
+    version: i32,
+    content: String,
+}
+
 pub struct RustAnalyzerClient {
     pub(super) process: Option<Child>,
     pub(super) request_id: Arc<Mutex<u64>>,
@@ -26,7 +32,8 @@ pub struct RustAnalyzerClient {
     pub(super) stdin: Option<BufWriter<tokio::process::ChildStdin>>,
     pub(super) pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     pub(super) initialized: bool,
-    pub(super) open_documents: Arc<Mutex<HashSet<String>>>,
+    pub(super) workspace_diagnostics_supported: bool,
+    pub(super) open_documents: Arc<Mutex<HashMap<String, OpenDocumentState>>>,
     pub(super) diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
 }
 
@@ -50,7 +57,8 @@ impl RustAnalyzerClient {
             stdin: None,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             initialized: false,
-            open_documents: Arc::new(Mutex::new(HashSet::new())),
+            workspace_diagnostics_supported: false,
+            open_documents: Arc::new(Mutex::new(HashMap::new())),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -277,7 +285,17 @@ impl RustAnalyzerClient {
             }
         });
 
-        self.send_request("initialize", Some(init_params)).await?;
+        let init_response = self.send_request("initialize", Some(init_params)).await?;
+        self.workspace_diagnostics_supported = init_response
+            .get("capabilities")
+            .and_then(|caps| caps.get("diagnosticProvider"))
+            .and_then(|provider| provider.get("workspaceDiagnostics"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        info!(
+            "workspace/diagnostic support: {}",
+            self.workspace_diagnostics_supported
+        );
         self.send_notification("initialized", Some(json!({})))
             .await?;
 
@@ -290,41 +308,81 @@ impl RustAnalyzerClient {
     }
 
     pub async fn open_document(&mut self, uri: &str, content: &str) -> Result<()> {
-        // Check if document is already open.
-        {
-            let open_docs = self.open_documents.lock().await;
-            if open_docs.contains(uri) {
-                info!("Document already open: {}", uri);
-                return Ok(());
-            }
+        enum DocumentSyncAction {
+            NoChange,
+            Open { version: i32 },
+            Change { version: i32 },
         }
 
-        // Clear any existing diagnostics for this URI to ensure fresh data.
-        {
-            let mut diag_lock = self.diagnostics.lock().await;
-            diag_lock.remove(uri);
-        }
-
-        info!("Opening document: {}", uri);
-        let params = json!({
-            "textDocument": {
-                "uri": uri,
-                "languageId": "rust",
-                "version": 1,
-                "text": content
-            }
-        });
-
-        self.send_notification("textDocument/didOpen", Some(params.clone()))
-            .await?;
-
-        // Mark document as open.
-        {
+        let action = {
             let mut open_docs = self.open_documents.lock().await;
-            open_docs.insert(uri.to_string());
+            match open_docs.get_mut(uri) {
+                Some(state) if state.content == content => {
+                    info!("Document already open and up to date: {}", uri);
+                    DocumentSyncAction::NoChange
+                }
+                Some(state) => {
+                    state.version += 1;
+                    state.content = content.to_string();
+                    DocumentSyncAction::Change {
+                        version: state.version,
+                    }
+                }
+                None => {
+                    open_docs.insert(
+                        uri.to_string(),
+                        OpenDocumentState {
+                            version: 1,
+                            content: content.to_string(),
+                        },
+                    );
+                    DocumentSyncAction::Open { version: 1 }
+                }
+            }
+        };
+
+        if matches!(action, DocumentSyncAction::NoChange) {
+            return Ok(());
         }
 
-        // Send didSave to trigger cargo check.
+        // Clear existing diagnostics for this URI so callers don't see stale entries
+        // while waiting for fresh publishDiagnostics updates.
+        self.diagnostics.lock().await.remove(uri);
+
+        match action {
+            DocumentSyncAction::NoChange => {}
+            DocumentSyncAction::Open { version } => {
+                info!("Opening document: {}", uri);
+                let params = json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "rust",
+                        "version": version,
+                        "text": content
+                    }
+                });
+                self.send_notification("textDocument/didOpen", Some(params))
+                    .await?;
+            }
+            DocumentSyncAction::Change { version } => {
+                info!("Document changed, sending didChange: {}", uri);
+                let params = json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "version": version
+                    },
+                    "contentChanges": [
+                        {
+                            "text": content
+                        }
+                    ]
+                });
+                self.send_notification("textDocument/didChange", Some(params))
+                    .await?;
+            }
+        }
+
+        // Send didSave to trigger checkOnSave diagnostics refresh.
         let save_params = json!({
             "textDocument": {
                 "uri": uri
@@ -355,6 +413,7 @@ impl RustAnalyzerClient {
         self.open_documents.lock().await.clear();
         self.diagnostics.lock().await.clear();
         self.initialized = false;
+        self.workspace_diagnostics_supported = false;
         Ok(())
     }
 }
