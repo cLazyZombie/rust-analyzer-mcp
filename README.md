@@ -107,6 +107,24 @@ Add this to your Claude Desktop configuration (`claude_desktop_config.json`):
 **Note:** If installed from crates.io, the command will be in your PATH. For Claude Desktop, you
 may want to specify a `cwd` parameter if you want to analyze a specific project by default.
 
+### Codex CLI Configuration
+
+Add the server to Codex:
+
+```bash
+# If installed from crates.io
+codex mcp add rust-analyzer -- rust-analyzer-mcp
+
+# If built from source
+codex mcp add rust-analyzer -- /full/path/to/rust-analyzer-mcp
+```
+
+You can verify the entry with:
+
+```bash
+codex mcp list
+```
+
 ### Other MCP Clients
 
 For other MCP clients, run the server with:
@@ -340,4 +358,3 @@ This is a foundation implementation that covers the most common rust-analyzer fe
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
